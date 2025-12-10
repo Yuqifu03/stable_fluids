@@ -4,10 +4,6 @@ from scipy.sparse.linalg import factorized, cg
 from scipy.sparse import eye
 
 from .utils import difference, operator
-# import torch
-# import torch.nn.functional as F
-
-# import taichi as ti
 
 class Fluid:
     def __init__(self, shape, *quantities, viscosity=0.001, diffusion=0.001, dissipation=0.001, pressure_order=1):
@@ -28,7 +24,6 @@ class Fluid:
         if self.dimensions >= 3:
             def cg_solver(A):
                 def solve(b):
-                    # FIX: Changed 'tol' to 'rtol' for newer SciPy versions
                     x, info = cg(A, b, rtol=1e-5, maxiter=50)
                     return x
                 return solve
@@ -111,7 +106,7 @@ class Fluid:
             setattr(self, q, current_q / (1 + dt * self.dissipation))
 
         return divergence, curl, pressure
-    
+
 import taichi as ti
 import numpy as np
 from src.utils import (
@@ -143,13 +138,11 @@ class Fluid3D:
 
         self._build_kernels()
 
-    # ------------------ initialization ------------------
     @ti.kernel
     def init_velocity_field(self):
         for i in ti.grouped(self.velocities):
             self.velocities[i] = ti.Vector([0.0, 0.0, 0.0])
 
-    # ------------------ core kernels ------------------
     def _build_kernels(self):
 
         # ------------- 1. Advect kernel -----------------
@@ -278,7 +271,6 @@ class Fluid3D:
                 radius = 0.2 * r
                 vel[i, j, k] += dp * dt * ti.exp(-d2 / radius) * 40
 
-        # expose kernels
         self.advect_kernel = advect_kernel
         self.solve_div_kernel = solve_div_kernel
         self.jacobi_kernel = jacobi_kernel

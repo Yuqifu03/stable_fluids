@@ -39,7 +39,6 @@ class StarryWaterScenario:
         
         arr = np.array(big).astype(np.float32) / 255.0
         
-        # Blend grain
         texture = (1 - grain) * 0.5 + grain * arr
         texture = texture * 0.4 + 0.8 
         return texture
@@ -55,13 +54,9 @@ class StarryWaterScenario:
         
         bg_color = (1 - mix_factor)[..., None] * color_bg_deep + mix_factor[..., None] * color_bg_light
 
-        # 2. Stars: Based on dye density
         star_intensity = np.clip(dye_field, 0, 1)[..., None]
         star_color = (star_intensity ** 0.5) * color_star_core + (1 - star_intensity**0.5) * color_star_edge
-        
-        # 3. Composite
         final_color = bg_color * (1 - star_intensity * 0.8) + star_color * star_intensity
-        
         return np.clip(final_color * 255, 0, 255).astype('uint8')
 
     def _add_vortex(self, x, y, strength, radius):
@@ -77,8 +72,7 @@ class StarryWaterScenario:
         dist = np.sqrt(dist_sq) + 1e-6
         
         falloff = np.exp(-dist_sq / (2 * radius**2))
-        
-        # Velocity vectors perpendicular to radius
+
         u = -dy / dist * strength * falloff
         v =  dx / dist * strength * falloff
         
@@ -86,21 +80,13 @@ class StarryWaterScenario:
         self.fluid.velocity[1] += v
 
     def step(self):
-        """
-        Executes the simulation loop and returns a list of PIL Images.
-        """
         print(f"Scenario: Starry Water | Resolution: {self.resolution} | Frames: {self.duration}")
-        
-        # --- Initialization Phase ---
-        
-        # 1. Large Structure: Create opposing vortices to form an "S" shape curve
         self._add_vortex(x=self.w*0.3, y=self.h*0.5, strength=80.0, radius=80)
         self._add_vortex(x=self.w*0.7, y=self.h*0.4, strength=-70.0, radius=90)
         
         # Add a gentle base flow at the bottom
         self.fluid.velocity[0, int(self.h*0.8):, :] += 1.0 
 
-        # 2. Star Placement
         num_stars = 12
         star_positions = []
         for _ in range(num_stars):
@@ -111,16 +97,13 @@ class StarryWaterScenario:
             self._add_vortex(sx, sy, strength=15.0 * (1 if np.random.rand()>0.5 else -1), radius=15)
 
         frames = []
-        
-        # --- Simulation Loop ---
+
         for f in range(self.duration):
             if f % 20 == 0:
                 print(f"  Rendering frame {f}/{self.duration}...")
 
-            # Inject Dye (Light) at star positions
             for (sx, sy) in star_positions:
                 radius = 6
-                # Create coordinate grids for the slice
                 y_s, y_e = max(0, sy-radius), min(self.h, sy+radius)
                 x_s, x_e = max(0, sx-radius), min(self.w, sx+radius)
                 
@@ -129,29 +112,71 @@ class StarryWaterScenario:
                 
                 # Stop injection after 150 frames to let it drift
                 if f < 150: 
-                    # Slight flicker in intensity
                     intensity = 1.0 + 0.2 * np.sin(f * 0.2)
                     self.fluid.dye[y_s:y_e, x_s:x_e][mask] += 0.5 * intensity
 
-            # Physics Step
             step_result = self.fluid.step()
             
             if isinstance(step_result, (tuple, list)) and len(step_result) >= 2:
                 curl = step_result[1]
             else:
-                # Fallback if step() doesn't return curl
                 curl = np.zeros((self.h, self.w)) 
-
-            # Rendering Step
+                
             rgb = self._apply_palette(curl, self.fluid.dye)
-            
-            # Apply Texture
+
             rgb = rgb * self.canvas_tex[..., None]
             rgb = np.clip(rgb, 0, 255).astype('uint8')
             
             frames.append(Image.fromarray(rgb))
             
         return frames
+    
+    def setup_gui(self):
+        self.fluid = Fluid(
+            self.resolution,
+            'dye',
+            viscosity=0.002,
+            diffusion=0.001,
+            dissipation=0.0005
+        )
+
+        self._add_vortex(x=self.w*0.3, y=self.h*0.5, strength=80.0, radius=80)
+        self._add_vortex(x=self.w*0.7, y=self.h*0.4, strength=-70.0, radius=90)
+        self.fluid.velocity[0, int(self.h*0.8):, :] += 1.0 
+
+        self.gui_star_positions = []
+        num_stars = 12
+        for _ in range(num_stars):
+            sx = np.random.randint(20, self.w-20)
+            sy = np.random.randint(20, int(self.h*0.6))
+            self.gui_star_positions.append((sx, sy))
+            self._add_vortex(sx, sy, strength=15.0 * (1 if np.random.rand()>0.5 else -1), radius=15)
+
+    def render_gui_frame(self, frame_idx):
+        f = frame_idx
+        
+        for (sx, sy) in self.gui_star_positions:
+            radius = 6
+            y_s, y_e = max(0, sy-radius), min(self.h, sy+radius)
+            x_s, x_e = max(0, sx-radius), min(self.w, sx+radius)
+            
+            y_slice, x_slice = np.ogrid[y_s:y_e, x_s:x_e]
+            mask = (x_slice - sx)**2 + (y_slice - sy)**2 <= radius**2
+            
+            if f < 150: 
+                intensity = 1.0 + 0.2 * np.sin(f * 0.2)
+                self.fluid.dye[y_s:y_e, x_s:x_e][mask] += 0.5 * intensity
+
+        step_result = self.fluid.step()
+        
+        if isinstance(step_result, (tuple, list)) and len(step_result) >= 2:
+            curl = step_result[1]
+        else:
+            curl = np.zeros((self.h, self.w))
+
+        rgb = self._apply_palette(curl, self.fluid.dye)
+        rgb = rgb * self.canvas_tex[..., None]
+        return np.clip(rgb, 0, 255).astype('uint8')
 
 
 import taichi as ti
