@@ -109,32 +109,30 @@ class Fluid:
 
 import taichi as ti
 import numpy as np
-from src.utils import (
-    I, clamp, sample_trilinear, sample_min, sample_max,
-    backtrace, semi_lagrangian, BFECC
-)
+from src.utils import sample_trilinear,semi_lagrangian
 
+@ti.data_oriented
 class Fluid3D:
-    def __init__(self, n=128, dt=0.03, rho=1, jacobi_iters=100,
-                 RK=3, enable_BFECC=True, enable_clipping=True):
+    def __init__(self, n=128, dt=0.03, rho=1, jacobi_iters=30,
+                 RK=3, 
+                 enable_clipping=True):
         self.n = n
         self.dt = dt
         self.dx = 1 / n
         self.rho = rho
         self.jacobi_iters = jacobi_iters
         self.RK = RK
-        self.enable_BFECC = enable_BFECC
         self.enable_clipping = enable_clipping
 
         self.stagger = ti.Vector([0.5, 0.5, 0.5])
 
         self.velocities = ti.Vector.field(3, dtype=ti.f32, shape=(n, n, n))
         self.new_velocities = ti.Vector.field(3, dtype=ti.f32, shape=(n, n, n))
-        self.new_new_velocities = ti.Vector.field(3, dtype=ti.f32, shape=(n, n, n))
-
+        
         self.pressures = ti.field(dtype=ti.f32, shape=(n, n, n))
         self.new_pressures = ti.field(dtype=ti.f32, shape=(n, n, n))
         self.divergences = ti.field(dtype=ti.f32, shape=(n, n, n))
+        self.curl = ti.Vector.field(3, dtype=ti.f32, shape=(n, n, n))
 
         self._build_kernels()
 
@@ -144,94 +142,60 @@ class Fluid3D:
             self.velocities[i] = ti.Vector([0.0, 0.0, 0.0])
 
     def _build_kernels(self):
-
-        # ------------- 1. Advect kernel -----------------
+        # 1. Advect
         @ti.kernel
-        def advect_kernel(
-            vel: ti.template(),
-            field: ti.template(),
-            new_field: ti.template(),
-            new_new_field: ti.template(),
-            dt: ti.f32
-        ):
-            if ti.static(self.enable_BFECC):
-                BFECC(vel, field, new_field, new_new_field, dt)
-            else:
-                semi_lagrangian(vel, field, new_field, dt)
+        def advect_kernel(vel: ti.template(), field: ti.template(), new_field: ti.template(), dt: ti.f32):
+            semi_lagrangian(vel, field, new_field, dt)
 
-        # ------------- 2. Divergence kernel --------------
+        # 3. Divergence
         @ti.kernel
-        def solve_div_kernel(
-            vel: ti.template(),
-            divergences: ti.template()
-        ):
-            n = self.n
+        def solve_div_kernel(vel: ti.template(), divergences: ti.template()):
             dx = self.dx
             stagger = self.stagger
-
+            n = self.n
             for i, j, k in vel:
                 c = (ti.Vector([i, j, k]) + stagger) * dx
-                l = c - ti.Vector([1, 0, 0]) * dx
-                r = c + ti.Vector([1, 0, 0]) * dx
-                d = c - ti.Vector([0, 1, 0]) * dx
-                u = c + ti.Vector([0, 1, 0]) * dx
-                b = c - ti.Vector([0, 0, 1]) * dx
-                f = c + ti.Vector([0, 0, 1]) * dx
-
-                v_c = sample_trilinear(vel, c)
-                v_l = sample_trilinear(vel, l).x
-                v_r = sample_trilinear(vel, r).x
-                v_d = sample_trilinear(vel, d).y
-                v_u = sample_trilinear(vel, u).y
-                v_b = sample_trilinear(vel, b).z
-                v_f = sample_trilinear(vel, f).z
-
-                if i == 0: v_l = -v_c.x
-                if i == n - 1: v_r = -v_c.x
-                if j == 0: v_d = -v_c.y
-                if j == n - 1: v_u = -v_c.y
-                if k == 0: v_b = -v_c.z
-                if k == n - 1: v_f = -v_c.z
+                v_l = sample_trilinear(vel, c - ti.Vector([1, 0, 0]) * dx).x
+                v_r = sample_trilinear(vel, c + ti.Vector([1, 0, 0]) * dx).x
+                v_d = sample_trilinear(vel, c - ti.Vector([0, 1, 0]) * dx).y
+                v_u = sample_trilinear(vel, c + ti.Vector([0, 1, 0]) * dx).y
+                v_b = sample_trilinear(vel, c - ti.Vector([0, 0, 1]) * dx).z
+                v_f = sample_trilinear(vel, c + ti.Vector([0, 0, 1]) * dx).z
+                
+                # 简单边界
+                if i == 0: v_l = -sample_trilinear(vel, c).x
+                if i == n - 1: v_r = -sample_trilinear(vel, c).x
+                if j == 0: v_d = -sample_trilinear(vel, c).y
+                if j == n - 1: v_u = -sample_trilinear(vel, c).y
+                if k == 0: v_b = -sample_trilinear(vel, c).z
+                if k == n - 1: v_f = -sample_trilinear(vel, c).z
 
                 divergences[i, j, k] = (v_r - v_l + v_u - v_d + v_f - v_b) / (2 * dx)
 
-        # ------------- 3. Jacobi pressure solve -----------
+        # 4. Pressure Jacobi
         @ti.kernel
-        def jacobi_kernel(
-            pressures: ti.template(),
-            new_pressures: ti.template()
-        ):
-            n = self.n
-            dx = self.dx
-            dt = self.dt
+        def jacobi_pressure_kernel(pressures: ti.template(), new_pressures: ti.template()):
             rho = self.rho
+            dt = self.dt
+            dx = self.dx
             stagger = self.stagger
-
             for i, j, k in pressures:
                 c = (ti.Vector([i, j, k]) + stagger) * dx
-                offsets = [
-                    ti.Vector([1, 0, 0]), ti.Vector([-1, 0, 0]),
-                    ti.Vector([0, 1, 0]), ti.Vector([0, -1, 0]),
-                    ti.Vector([0, 0, 1]), ti.Vector([0, 0, -1]),
-                ]
-                s = 0.0
-                for off in ti.static(offsets):
-                    s += sample_trilinear(pressures, c + off * dx)
+                s = sample_trilinear(pressures, c + ti.Vector([1, 0, 0]) * dx) + \
+                    sample_trilinear(pressures, c - ti.Vector([1, 0, 0]) * dx) + \
+                    sample_trilinear(pressures, c + ti.Vector([0, 1, 0]) * dx) + \
+                    sample_trilinear(pressures, c - ti.Vector([0, 1, 0]) * dx) + \
+                    sample_trilinear(pressures, c + ti.Vector([0, 0, 1]) * dx) + \
+                    sample_trilinear(pressures, c - ti.Vector([0, 0, 1]) * dx)
+                new_pressures[i, j, k] = (s - self.divergences[i, j, k] * rho / dt * dx * dx) / 6.0
 
-                new_pressures[i, j, k] = (s - self.divergences[i, j, k] * rho / dt * dx * dx) / 6
-
-        # ------------- 4. Project velocity field -----------
+        # 5. Project
         @ti.kernel
-        def project_kernel(
-            vel: ti.template(),
-            pressures: ti.template()
-        ):
-            n = self.n
-            dx = self.dx
+        def project_kernel(vel: ti.template(), pressures: ti.template()):
             rho = self.rho
             dt = self.dt
+            dx = self.dx
             stagger = self.stagger
-
             for i, j, k in vel:
                 c = (ti.Vector([i, j, k]) + stagger) * dx
                 p_r = sample_trilinear(pressures, c + ti.Vector([1, 0, 0]) * dx)
@@ -240,64 +204,107 @@ class Fluid3D:
                 p_d = sample_trilinear(pressures, c - ti.Vector([0, 1, 0]) * dx)
                 p_f = sample_trilinear(pressures, c + ti.Vector([0, 0, 1]) * dx)
                 p_b = sample_trilinear(pressures, c - ti.Vector([0, 0, 1]) * dx)
-
-                grad_p = ti.Vector([
-                    p_r - p_l,
-                    p_u - p_d,
-                    p_f - p_b
-                ]) / (2 * dx)
-
+                grad_p = ti.Vector([p_r - p_l, p_u - p_d, p_f - p_b]) / (2 * dx)
                 vel[i, j, k] -= grad_p / rho * dt
 
-        # ------------- 5. Apply force kernel ----------------
+        # 6. Force
         @ti.kernel
-        def apply_force_kernel(
-            vel: ti.template(),
-            pos: ti.types.vector(3, ti.f32),
-            r: ti.f32,
-            force: ti.types.vector(3, ti.f32)
-        ):
+        def apply_force_kernel(vel: ti.template(), pos: ti.types.vector(3, ti.f32), r: ti.f32, force: ti.types.vector(3, ti.f32)):
             dt = self.dt
             dx = self.dx
             stagger = self.stagger
-
-            dp = force + (ti.Vector([ti.random(), ti.random(), ti.random()]) - 0.5) * 0.001
-
+            dp = force + (ti.Vector([ti.random(), ti.random(), ti.random()]) - 0.5) * 0.0001
             for i, j, k in vel:
-                p = ti.Vector([(i + stagger.x) * dx,
-                               (j + stagger.y) * dx,
-                               (k + stagger.z) * dx])
+                p = ti.Vector([(i + stagger.x) * dx, (j + stagger.y) * dx, (k + stagger.z) * dx])
                 d2 = (p - pos).norm_sqr()
-                radius = 0.2 * r
-                vel[i, j, k] += dp * dt * ti.exp(-d2 / radius) * 40
+                vel[i, j, k] += dp * dt * ti.exp(-d2 / (0.2 * r)) * 40
 
         self.advect_kernel = advect_kernel
         self.solve_div_kernel = solve_div_kernel
-        self.jacobi_kernel = jacobi_kernel
+        self.jacobi_pressure_kernel = jacobi_pressure_kernel
         self.project_kernel = project_kernel
         self.apply_force_kernel = apply_force_kernel
 
-    # ------------------ high-level API ------------------
+        # ------------- 7. Compute Curl----------------
+        @ti.kernel
+        def compute_curl_kernel(vel: ti.template(), curl: ti.template()):
+            dx = self.dx
+            stagger = self.stagger
+            for i, j, k in vel:
+                c = (ti.Vector([i, j, k]) + stagger) * dx
+
+                v_u = sample_trilinear(vel, c + ti.Vector([0, 1, 0]) * dx).z
+                v_d = sample_trilinear(vel, c - ti.Vector([0, 1, 0]) * dx).z
+                v_f = sample_trilinear(vel, c + ti.Vector([0, 0, 1]) * dx).y
+                v_b = sample_trilinear(vel, c - ti.Vector([0, 0, 1]) * dx).y
+                curl_x = (v_u - v_d) - (v_f - v_b)
+
+                # du/dz - dw/dx
+                v_f_x = sample_trilinear(vel, c + ti.Vector([0, 0, 1]) * dx).x
+                v_b_x = sample_trilinear(vel, c - ti.Vector([0, 0, 1]) * dx).x
+                v_r_z = sample_trilinear(vel, c + ti.Vector([1, 0, 0]) * dx).z
+                v_l_z = sample_trilinear(vel, c - ti.Vector([1, 0, 0]) * dx).z
+                curl_y = (v_f_x - v_b_x) - (v_r_z - v_l_z)
+
+                # dv/dx - du/dy
+                v_r_y = sample_trilinear(vel, c + ti.Vector([1, 0, 0]) * dx).y
+                v_l_y = sample_trilinear(vel, c - ti.Vector([1, 0, 0]) * dx).y
+                v_u_x = sample_trilinear(vel, c + ti.Vector([0, 1, 0]) * dx).x
+                v_d_x = sample_trilinear(vel, c - ti.Vector([0, 1, 0]) * dx).x
+                curl_z = (v_r_y - v_l_y) - (v_u_x - v_d_x)
+
+                curl[i, j, k] = ti.Vector([curl_x, curl_y, curl_z]) / (2 * dx)
+
+        @ti.kernel
+        def vorticity_confinement_kernel(vel: ti.template(), curl: ti.template(), strength: ti.f32):
+            dt = self.dt
+            dx = self.dx
+            stagger = self.stagger
+            
+            for i, j, k in vel:
+                c = (ti.Vector([i, j, k]) + stagger) * dx
+                
+                curl_len_r = sample_trilinear(curl, c + ti.Vector([1, 0, 0]) * dx).norm()
+                curl_len_l = sample_trilinear(curl, c - ti.Vector([1, 0, 0]) * dx).norm()
+                curl_len_u = sample_trilinear(curl, c + ti.Vector([0, 1, 0]) * dx).norm()
+                curl_len_d = sample_trilinear(curl, c - ti.Vector([0, 1, 0]) * dx).norm()
+                curl_len_f = sample_trilinear(curl, c + ti.Vector([0, 0, 1]) * dx).norm()
+                curl_len_b = sample_trilinear(curl, c - ti.Vector([0, 0, 1]) * dx).norm()
+
+                grad_len = ti.Vector([
+                    curl_len_r - curl_len_l,
+                    curl_len_u - curl_len_d,
+                    curl_len_f - curl_len_b
+                ]) / (2 * dx)
+
+                grad_len_norm = grad_len.norm()
+
+                if grad_len_norm > 1e-5:
+                    N = grad_len / grad_len_norm
+                    omega = curl[i, j, k]
+                    force = N.cross(omega) * strength * dx
+                    
+                    vel[i, j, k] += force * dt
+        
+        self.compute_curl_kernel = compute_curl_kernel
+        self.vorticity_confinement_kernel = vorticity_confinement_kernel
+
+    # ------------------ High-level API ------------------
+    def vorticity_confinement(self, strength=2.0):
+        self.compute_curl_kernel(self.velocities, self.curl)
+        self.vorticity_confinement_kernel(self.velocities, self.curl, strength)
+
     def advect(self):
-        self.advect_kernel(
-            self.velocities,
-            self.velocities,
-            self.new_velocities,
-            self.new_new_velocities,
-            self.dt
-        )
+        self.advect_kernel(self.velocities, self.velocities, self.new_velocities, self.dt)
         self.velocities, self.new_velocities = self.new_velocities, self.velocities
 
     def add_force(self, pos, r, force):
         self.apply_force_kernel(self.velocities, pos, r, force)
 
-    def solve_divergence(self):
-        self.solve_div_kernel(self.velocities, self.divergences)
-
-    def pressure_solve(self):
-        for _ in range(self.jacobi_iters):
-            self.jacobi_kernel(self.pressures, self.new_pressures)
-            self.pressures, self.new_pressures = self.new_pressures, self.pressures
-
     def project(self):
+        """Standard projection step: Divergence -> Solve Pressure -> Subtract Gradient"""
+        self.solve_div_kernel(self.velocities, self.divergences)
+        for _ in range(self.jacobi_iters):
+            self.jacobi_pressure_kernel(self.pressures, self.new_pressures)
+            self.pressures, self.new_pressures = self.new_pressures, self.pressures
         self.project_kernel(self.velocities, self.pressures)

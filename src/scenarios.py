@@ -186,69 +186,111 @@ from src.utils import sample_trilinear
 @ti.data_oriented
 class Quicksand:
     def __init__(self, duration=1000):
-        self.fluid = Fluid3D(jacobi_iters=duration)
+        self.fluid = Fluid3D(
+            dt=0.01,           
+            jacobi_iters=30,
+        )
 
-        self.pn_max = 10000000
+        self.pn_max = 800000 
         self.pn_current = 0
-        self.rate = 100000
+        self.rate = 8000      
+        
+        self.frame_count = 0
+        self.emit_end_frame = 50 
 
         self.particles = ti.Vector.field(3, dtype=ti.f32, shape=self.pn_max)
         self.particle_colors = ti.Vector.field(3, dtype=ti.f32, shape=self.pn_max)
-        self.particle_radius = 0.0015
+        
+        self.particle_radius = 0.0005
 
-        self.source_center_L = ti.Vector([0.05, 0.5, 0.5])
-        self.source_center_R = ti.Vector([0.95, 0.5, 0.5])
-        self.source_velocity_L = ti.Vector([0.01, 0.0, 0.0])
-        self.source_velocity_R = ti.Vector([-0.01, 0.0, 0.0])
-        self.source_radius = 0.001
+        self.source_center = ti.Vector([0.5, 0.9, 0.5]) 
+        
+        self.emit_radius = 0.006 
+        self.force_radius = 0.05
+        
+        self.source_velocity = ti.Vector([0.0, -1.0, 0.0])
 
         self.init_particles()
 
     @ti.kernel
     def init_particles(self):
         for i in range(self.pn_max):
-            r = ti.sqrt(ti.random()) * self.source_radius
-            a = ti.random() * 6.28318
-            b = ti.random() * 3.141592
+            self.particles[i] = ti.Vector([-1.0, -1.0, -1.0])
+
+    @ti.kernel
+    def emit_particles(self, start_idx: ti.i32, end_idx: ti.i32, time: ti.f32):
+        for i in range(start_idx, end_idx):
+            r = ti.pow(ti.random(), 1.0/2.0) * self.emit_radius
+            angle = ti.random() * 6.2831853
+
+            smear_length = 0.03
+            random_offset_y = (ti.random() - 0.5) * smear_length
 
             offset = ti.Vector([
-                r * ti.cos(a) * ti.sin(b),
-                r * ti.sin(a) * ti.sin(b),
-                r * ti.cos(b)
+                r * ti.cos(angle),
+                random_offset_y, 
+                r * ti.sin(angle)
             ])
 
-            if i % 2 == 0:
-                self.particles[i] = offset + self.source_center_L
-                self.particle_colors[i] = ti.Vector([0, 1, 1])
-            else:
-                self.particles[i] = offset + self.source_center_R
-                self.particle_colors[i] = ti.Vector([1, 0.5, 0])
+            self.particles[i] = self.source_center + offset
+            
+            t = time * 0.1
+            r_val = 0.5 + 0.5 * ti.sin(t)        
+            g_val = 0.5 + 0.5 * ti.cos(t * 0.7)  
+            b_val = 0.9                          
+            
+            self.particle_colors[i] = ti.Vector([r_val, g_val, b_val])
 
     @ti.kernel
     def update_particles(self, pn: ti.i32):
         dt = self.fluid.dt
         for i in range(pn):
-            v = sample_trilinear(self.fluid.velocities, self.particles[i])
-            self.particles[i] += v * dt
+            p = self.particles[i]
+            if p.x > 0.02 and p.x < 0.98 and p.y > 0.02 and p.y < 0.98 and p.z > 0.02 and p.z < 0.98:
+                v = sample_trilinear(self.fluid.velocities, p)
+                self.particles[i] += v * dt
+            else:
+                self.particles[i] = ti.Vector([-1.0, -1.0, -1.0])
 
     def step(self):
         fluid = self.fluid
-
+        
         fluid.advect()
 
-        fluid.add_force(self.source_center_L, self.source_radius, self.source_velocity_L)
-        fluid.add_force(self.source_center_R, self.source_radius, self.source_velocity_R)
+        if self.frame_count < self.emit_end_frame:
 
-        fluid.solve_divergence()
-        fluid.pressure_solve()
+            wobble_x = np.sin(self.frame_count * 0.2) * 0.15
+            wobble_z = np.cos(self.frame_count * 0.15) * 0.15
+
+            noise_x = (np.random.rand() - 0.5) * 0.2
+            noise_z = (np.random.rand() - 0.5) * 0.2
+
+            force_dir = ti.Vector([wobble_x + noise_x, -0.6, wobble_z + noise_z]) 
+            
+            fluid.add_force(self.source_center, self.force_radius, force_dir)
+
+            num_emit = 8000
+            start_idx = self.pn_current % self.pn_max
+            end_idx = start_idx + num_emit
+            
+            if self.pn_current < self.pn_max:
+                self.pn_current += num_emit
+            
+            if end_idx > self.pn_max:
+                self.emit_particles(start_idx, self.pn_max, float(self.frame_count))
+                self.emit_particles(0, end_idx - self.pn_max, float(self.frame_count))
+            else:
+                self.emit_particles(start_idx, end_idx, float(self.frame_count))
+
+        fluid.vorticity_confinement(strength=10.0)
+        
         fluid.project()
 
-        if self.pn_current < self.pn_max:
-            self.pn_current += self.rate
-
-        self.update_particles(self.pn_current)
-    
-
+        active_count = min(self.pn_current, self.pn_max)
+        self.update_particles(active_count)
+        
+        self.frame_count += 1
+ 
 SCENARIO_MAP = {
     'starry_water': StarryWaterScenario,
     'quick_sand': Quicksand

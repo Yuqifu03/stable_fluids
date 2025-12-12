@@ -109,10 +109,3 @@ def semi_lagrangian(vel, field, new_field, dt):
     for i in ti.grouped(field):
         p = (i + stagger) * dx
         new_field[i] = sample_trilinear(field, backtrace(vel, p, dt))
-
-@ti.func
-def BFECC(vel, field, new_field, new_new_field, dt):
-    semi_lagrangian(vel, field, new_field, dt)
-    semi_lagrangian(vel, new_field, new_new_field, -dt)
-    for i in ti.grouped(field):
-        new_field[i] = new_field[i] - 0.5 * (new_new_field[i] - field[i])
